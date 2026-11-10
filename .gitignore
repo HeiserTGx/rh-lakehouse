@@ -1,0 +1,2 @@
+# Raw data is uploaded to a Databricks volume, not committed.
+data/
