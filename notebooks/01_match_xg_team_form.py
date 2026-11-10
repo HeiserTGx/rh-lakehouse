@@ -31,7 +31,12 @@ spark.sql("CREATE VOLUME IF NOT EXISTS workspace.rh_lakehouse.raw")
 # MAGIC
 # MAGIC A CSV carries no types. Spark can guess them (`inferSchema`), but guessing means an
 # MAGIC extra pass over the file and a schema that can change when the data does. Declaring
-# MAGIC the schema makes the read cheap and makes a bad file fail loudly.
+# MAGIC the schema makes the read cheap and the types fixed.
+# MAGIC
+# MAGIC Two things the schema does not do on its own. By default a value that does not fit
+# MAGIC its type is read as null rather than raising, so the read uses `FAILFAST` to stop on
+# MAGIC a bad row instead. And the CSV reader ignores `nullable=False`: `printSchema` shows
+# MAGIC every column as nullable, because a text file cannot guarantee a value is present.
 
 # COMMAND ----------
 
@@ -56,7 +61,7 @@ match_schema = T.StructType(
     ]
 )
 
-matches = spark.read.csv(RAW_PATH, header=True, schema=match_schema)
+matches = spark.read.csv(RAW_PATH, header=True, schema=match_schema, mode="FAILFAST")
 
 matches.printSchema()
 print("matches:", matches.count())
