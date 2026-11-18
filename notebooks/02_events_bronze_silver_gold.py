@@ -29,6 +29,8 @@ import os
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
+from pyspark.sql import functions as F
+
 SOURCE = "https://raw.githubusercontent.com/hudl/open-data/master/data"
 RAW = "/Volumes/workspace/rh_lakehouse/raw"
 
@@ -96,28 +98,33 @@ land_season(competition_id=2, season_id=27)
 
 # COMMAND ----------
 
-from pyspark.sql import functions as F
-
 BRONZE = "workspace.rh_lakehouse.bronze_events"
 
-# One row per file, the whole file in a single column. competition_id and season_id
-# come from the folder names.
-files = spark.read.text(f"{RAW}/events", wholetext=True)
 
-bronze = files.select(
-    "competition_id",
-    "season_id",
-    F.regexp_extract(F.col("_metadata.file_name"), r"(\d+)\.json", 1)
-    .cast("long")
-    .alias("match_id"),
-    F.col("_metadata.file_path").alias("source_file"),
-    F.current_timestamp().alias("loaded_at"),
-    # The file is a list of events. Read it as a list of raw strings, then give each
-    # string its own row.
-    F.explode(F.from_json("value", "array<string>")).alias("event_json"),
-)
+def bronze_rows(competition_id: int, season_id: int):
+    """One raw row per event for one landed competition season."""
+    # One row per file, the whole file in a single column. basePath keeps
+    # competition_id and season_id, read from the folder names, as columns.
+    files = spark.read.option("basePath", f"{RAW}/events").text(
+        f"{RAW}/events/competition_id={competition_id}/season_id={season_id}",
+        wholetext=True,
+    )
+    return files.select(
+        "competition_id",
+        "season_id",
+        F.regexp_extract(F.col("_metadata.file_name"), r"(\d+)\.json", 1)
+        .cast("long")
+        .alias("match_id"),
+        F.col("_metadata.file_path").alias("source_file"),
+        F.current_timestamp().alias("loaded_at"),
+        # The file is a list of events. Read it as a list of raw strings, then give
+        # each string its own row.
+        F.explode(F.from_json("value", "array<string>")).alias("event_json"),
+    )
 
-bronze.write.mode("overwrite").saveAsTable(BRONZE)
+
+# First load: the table is created from the Premier League season alone.
+bronze_rows(competition_id=2, season_id=27).write.mode("overwrite").saveAsTable(BRONZE)
 
 # COMMAND ----------
 
@@ -159,35 +166,39 @@ event_schema = """
     shot struct<statsbomb_xg: double, outcome: struct<name: string>>
 """
 
-parsed = spark.table(BRONZE).withColumn(
-    "event", F.from_json("event_json", event_schema, {"mode": "FAILFAST"})
-)
 
-silver = parsed.select(
-    F.col("event.id").alias("event_id"),
-    "competition_id",
-    "season_id",
-    "match_id",
-    F.col("event.index").alias("event_index"),
-    F.col("event.period").alias("period"),
-    F.col("event.minute").alias("minute"),
-    F.col("event.second").alias("second"),
-    F.col("event.type.name").alias("event_type"),
-    F.col("event.team.id").alias("team_id"),
-    F.col("event.team.name").alias("team"),
-    # Null for events that belong to a team rather than a player, such as a line-up.
-    F.col("event.player.id").alias("player_id"),
-    F.col("event.player.name").alias("player"),
-    # Pitch position, where the event has one.
-    F.get(F.col("event.location"), F.lit(0)).alias("x"),
-    F.get(F.col("event.location"), F.lit(1)).alias("y"),
-    # Only shots carry these.
-    F.col("event.shot.statsbomb_xg").alias("shot_xg"),
-    F.col("event.shot.outcome.name").alias("shot_outcome"),
-)
+def silver_rows(bronze_df):
+    """Bronze rows parsed into typed columns, still one row per event."""
+    parsed = bronze_df.withColumn(
+        "event", F.from_json("event_json", event_schema, {"mode": "FAILFAST"})
+    )
+    return parsed.select(
+        F.col("event.id").alias("event_id"),
+        "competition_id",
+        "season_id",
+        "match_id",
+        F.col("event.index").alias("event_index"),
+        F.col("event.period").alias("period"),
+        F.col("event.minute").alias("minute"),
+        F.col("event.second").alias("second"),
+        F.col("event.type.name").alias("event_type"),
+        F.col("event.team.id").alias("team_id"),
+        F.col("event.team.name").alias("team"),
+        # Null for events that belong to a team rather than a player, such as a line-up.
+        F.col("event.player.id").alias("player_id"),
+        F.col("event.player.name").alias("player"),
+        # Pitch position, where the event has one.
+        F.get(F.col("event.location"), F.lit(0)).alias("x"),
+        F.get(F.col("event.location"), F.lit(1)).alias("y"),
+        # Only shots carry these.
+        F.col("event.shot.statsbomb_xg").alias("shot_xg"),
+        F.col("event.shot.outcome.name").alias("shot_outcome"),
+    )
+
 
 (
-    silver.write.mode("overwrite")
+    silver_rows(spark.table(BRONZE))
+    .write.mode("overwrite")
     .partitionBy("competition_id", "season_id")
     .saveAsTable(SILVER)
 )
@@ -228,20 +239,25 @@ display(
 
 GOLD = "workspace.rh_lakehouse.gold_team_match_xg"
 
-is_shot = F.col("event_type") == "Shot"
-is_goal = (F.col("shot_outcome") == "Goal") | (F.col("event_type") == "Own Goal For")
 
-gold = (
-    spark.table(SILVER)
-    .groupBy("competition_id", "season_id", "match_id", "team_id", "team")
-    .agg(
-        F.count(F.when(is_shot, True)).alias("shots"),
-        F.count(F.when(is_goal, True)).alias("goals"),
-        F.round(F.coalesce(F.sum("shot_xg"), F.lit(0.0)), 2).alias("xg"),
+def build_gold() -> None:
+    """Rebuild the gold table from everything currently in silver."""
+    is_shot = F.col("event_type") == "Shot"
+    is_goal = (F.col("shot_outcome") == "Goal") | (F.col("event_type") == "Own Goal For")
+    (
+        spark.table(SILVER)
+        .groupBy("competition_id", "season_id", "match_id", "team_id", "team")
+        .agg(
+            F.count(F.when(is_shot, True)).alias("shots"),
+            F.count(F.when(is_goal, True)).alias("goals"),
+            F.round(F.coalesce(F.sum("shot_xg"), F.lit(0.0)), 2).alias("xg"),
+        )
+        .write.mode("overwrite")
+        .saveAsTable(GOLD)
     )
-)
 
-gold.write.mode("overwrite").saveAsTable(GOLD)
+
+build_gold()
 
 # COMMAND ----------
 
@@ -266,4 +282,91 @@ display(
     )
     .orderBy(F.desc("goals"))
     .limit(6)
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 4 · A new season arrives: MERGE
+# MAGIC
+# MAGIC Everything above built the tables from scratch. That is fine once. It is the wrong
+# MAGIC way to add data: rebuilding silver for every new season means re-parsing every old
+# MAGIC season too.
+# MAGIC
+# MAGIC Here a second season lands (La Liga 2015/16) and only that season is processed.
+# MAGIC
+# MAGIC Bronze first. `replaceWhere` swaps out one season's rows and leaves the rest of the
+# MAGIC table alone, so loading the same season twice cannot double it.
+
+# COMMAND ----------
+
+# La Liga 2015/16
+land_season(competition_id=11, season_id=27)
+
+(
+    bronze_rows(competition_id=11, season_id=27)
+    .write.mode("overwrite")
+    .option("replaceWhere", "competition_id = 11 AND season_id = 27")
+    .saveAsTable(BRONZE)
+)
+
+display(spark.table(BRONZE).groupBy("competition_id", "season_id").count())
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Now silver. `MERGE` compares the incoming events with the table on `event_id`:
+# MAGIC
+# MAGIC - an event that is already there is updated in place
+# MAGIC - an event that is not there is inserted
+# MAGIC
+# MAGIC The Premier League rows are not read, parsed or rewritten. The result of a MERGE is
+# MAGIC a one-row table saying how many rows it inserted and updated.
+
+# COMMAND ----------
+
+new_events = silver_rows(
+    spark.table(BRONZE).filter("competition_id = 11 AND season_id = 27")
+)
+new_events.createOrReplaceTempView("new_events")
+
+merge_sql = f"""
+    MERGE INTO {SILVER} AS s
+    USING new_events AS n
+    ON s.competition_id = n.competition_id
+        AND s.season_id = n.season_id
+        AND s.event_id = n.event_id
+    WHEN MATCHED THEN UPDATE SET *
+    WHEN NOT MATCHED THEN INSERT *
+"""
+
+print("silver rows before:", spark.table(SILVER).count())
+display(spark.sql(merge_sql))
+print("silver rows after:", spark.table(SILVER).count())
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC The same MERGE again, with the same season. A plain append would add every row a
+# MAGIC second time. MERGE finds each event already in the table, so nothing is inserted
+# MAGIC and the row count does not move.
+
+# COMMAND ----------
+
+display(spark.sql(merge_sql))
+print("silver rows after a second run:", spark.table(SILVER).count())
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Gold is small, so it is simply rebuilt from silver.
+
+# COMMAND ----------
+
+build_gold()
+
+display(
+    spark.table(GOLD)
+    .groupBy("competition_id", "season_id")
+    .agg(F.count("*").alias("team_match_rows"), F.sum("goals").alias("goals"))
 )
