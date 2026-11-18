@@ -126,3 +126,89 @@ bronze_events = spark.table(BRONZE)
 print("matches:", bronze_events.select("match_id").distinct().count())
 print("bronze rows:", bronze_events.count())
 display(bronze_events.limit(3))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 2 · Silver: typed columns, one row per event
+# MAGIC
+# MAGIC Silver reads the raw text in bronze and pulls the useful fields into real columns
+# MAGIC with real types. The schema lists only the fields silver needs; everything else an
+# MAGIC event carries stays in bronze and can be added later without a new download.
+# MAGIC
+# MAGIC As in notebook 01 the parse uses `FAILFAST`, so an event that does not fit the
+# MAGIC schema stops the run instead of quietly becoming a row of nulls.
+# MAGIC
+# MAGIC The table is stored partitioned by competition and season: each season's rows are
+# MAGIC written to their own folder.
+
+# COMMAND ----------
+
+SILVER = "workspace.rh_lakehouse.silver_events"
+
+event_schema = """
+    id string,
+    index int,
+    period int,
+    minute int,
+    second int,
+    type struct<name: string>,
+    team struct<id: int, name: string>,
+    player struct<id: int, name: string>,
+    location array<double>,
+    shot struct<statsbomb_xg: double, outcome: struct<name: string>>
+"""
+
+parsed = spark.table(BRONZE).withColumn(
+    "event", F.from_json("event_json", event_schema, {"mode": "FAILFAST"})
+)
+
+silver = parsed.select(
+    F.col("event.id").alias("event_id"),
+    "competition_id",
+    "season_id",
+    "match_id",
+    F.col("event.index").alias("event_index"),
+    F.col("event.period").alias("period"),
+    F.col("event.minute").alias("minute"),
+    F.col("event.second").alias("second"),
+    F.col("event.type.name").alias("event_type"),
+    F.col("event.team.id").alias("team_id"),
+    F.col("event.team.name").alias("team"),
+    # Null for events that belong to a team rather than a player, such as a line-up.
+    F.col("event.player.id").alias("player_id"),
+    F.col("event.player.name").alias("player"),
+    # Pitch position, where the event has one.
+    F.get(F.col("event.location"), F.lit(0)).alias("x"),
+    F.get(F.col("event.location"), F.lit(1)).alias("y"),
+    # Only shots carry these.
+    F.col("event.shot.statsbomb_xg").alias("shot_xg"),
+    F.col("event.shot.outcome.name").alias("shot_outcome"),
+)
+
+(
+    silver.write.mode("overwrite")
+    .partitionBy("competition_id", "season_id")
+    .saveAsTable(SILVER)
+)
+
+# COMMAND ----------
+
+silver_events = spark.table(SILVER)
+
+print("silver rows:", silver_events.count())
+display(silver_events.groupBy("event_type").count().orderBy(F.desc("count")).limit(8))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC The first shots of one match (Chelsea v Stoke City), now as ordinary columns.
+
+# COMMAND ----------
+
+display(
+    silver_events.filter((F.col("match_id") == 3754061) & (F.col("event_type") == "Shot"))
+    .orderBy("event_index")
+    .select("minute", "team", "player", "x", "y", "shot_xg", "shot_outcome")
+    .limit(5)
+)
