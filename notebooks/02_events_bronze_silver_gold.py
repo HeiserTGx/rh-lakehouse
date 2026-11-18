@@ -245,11 +245,12 @@ display(
 
 GOLD = "workspace.rh_lakehouse.gold_team_match_xg"
 
+is_shot = F.col("event_type") == "Shot"
+is_goal = (F.col("shot_outcome") == "Goal") | (F.col("event_type") == "Own Goal For")
+
 
 def build_gold() -> None:
     """Rebuild the gold table from everything currently in silver."""
-    is_shot = F.col("event_type") == "Shot"
-    is_goal = (F.col("shot_outcome") == "Goal") | (F.col("event_type") == "Own Goal For")
     (
         spark.table(SILVER)
         .groupBy("competition_id", "season_id", "match_id", "team_id", "team")
@@ -377,4 +378,137 @@ display(
     spark.table(GOLD)
     .groupBy("competition_id", "season_id")
     .agg(F.count("*").alias("team_match_rows"), F.sum("goals").alias("goals"))
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 5 · Joining a big table to a small one: the broadcast join
+# MAGIC
+# MAGIC The events say which team did something, not whether that team was at home. That
+# MAGIC lives in the match list landed next to the events: one row per match, a few hundred
+# MAGIC rows against a few million events.
+
+# COMMAND ----------
+
+MATCHES = "workspace.rh_lakehouse.silver_matches"
+
+match_schema = """
+    match_id long,
+    match_date date,
+    match_week int,
+    home_team struct<home_team_id: int, home_team_name: string>,
+    away_team struct<away_team_id: int, away_team_name: string>,
+    home_score int,
+    away_score int
+"""
+
+(
+    spark.read.schema(match_schema)
+    .option("multiLine", True)
+    .option("mode", "FAILFAST")
+    .json(f"{RAW}/matches")
+    .select(
+        "competition_id",
+        "season_id",
+        "match_id",
+        "match_date",
+        "match_week",
+        F.col("home_team.home_team_id").alias("home_team_id"),
+        F.col("home_team.home_team_name").alias("home_team"),
+        F.col("away_team.away_team_id").alias("away_team_id"),
+        F.col("away_team.away_team_name").alias("away_team"),
+        "home_score",
+        "away_score",
+    )
+    .write.mode("overwrite")
+    .saveAsTable(MATCHES)
+)
+
+events = spark.table(SILVER)
+matches = spark.table(MATCHES)
+
+print("events:", events.count())
+print("matches:", matches.count())
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC A join needs rows with the same `match_id` in the same place. The general way to
+# MAGIC get there is to shuffle both tables by the join key, which here means moving every
+# MAGIC one of the events. The `merge` hint asks Spark for that plan so it can be seen.
+
+# COMMAND ----------
+
+join_keys = ["competition_id", "season_id", "match_id"]
+
+events.join(matches.hint("merge"), join_keys).explain()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC The match list is tiny. Instead of moving the events to meet it, Spark can send a
+# MAGIC full copy of the match list to every worker and leave the events where they are.
+# MAGIC That is a broadcast join: the small table is broadcast, the big table is not
+# MAGIC shuffled at all.
+# MAGIC
+# MAGIC Spark picks this on its own when it can tell a table is small. `F.broadcast` states
+# MAGIC it outright.
+
+# COMMAND ----------
+
+events_with_match = events.join(F.broadcast(matches), join_keys)
+
+events_with_match.explain()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC With home and away known, the events collapse to one row per match with each side's
+# MAGIC goals and xG. This is the shape of the match table notebook 01 started from, built
+# MAGIC here from the events. The official score from the match list is kept alongside as
+# MAGIC a check on the goals counted from events.
+
+# COMMAND ----------
+
+GOLD_MATCH = "workspace.rh_lakehouse.gold_match_xg"
+
+at_home = F.col("team_id") == F.col("home_team_id")
+
+(
+    events_with_match.groupBy(
+        "competition_id",
+        "season_id",
+        "match_id",
+        "match_date",
+        "home_team",
+        "away_team",
+        "home_score",
+        "away_score",
+    )
+    .agg(
+        F.count(F.when(is_goal & at_home, True)).alias("home_goals"),
+        F.count(F.when(is_goal & ~at_home, True)).alias("away_goals"),
+        F.round(F.coalesce(F.sum(F.when(at_home, F.col("shot_xg"))), F.lit(0.0)), 2).alias("home_xg"),
+        F.round(F.coalesce(F.sum(F.when(~at_home, F.col("shot_xg"))), F.lit(0.0)), 2).alias("away_xg"),
+    )
+    .write.mode("overwrite")
+    .saveAsTable(GOLD_MATCH)
+)
+
+gold_match = spark.table(GOLD_MATCH)
+
+print("matches:", gold_match.count())
+print(
+    "matches where goals from events differ from the official score:",
+    gold_match.filter(
+        (F.col("home_goals") != F.col("home_score"))
+        | (F.col("away_goals") != F.col("away_score"))
+    ).count(),
+)
+display(
+    gold_match.filter(F.col("competition_id") == 2)
+    .orderBy("match_date", "match_id")
+    .select("match_date", "home_team", "away_team", "home_goals", "away_goals", "home_xg", "away_xg")
+    .limit(5)
 )
