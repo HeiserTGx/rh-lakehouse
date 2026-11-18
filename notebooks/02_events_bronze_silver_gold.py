@@ -80,3 +80,49 @@ def land_season(competition_id: int, season_id: int) -> None:
 
 # Premier League 2015/16
 land_season(competition_id=2, season_id=27)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 1 · Bronze: one row per event, still raw
+# MAGIC
+# MAGIC Each file is one match: a single JSON list holding a few thousand events. Bronze
+# MAGIC splits that list into rows and stops there. The event itself is kept as the original
+# MAGIC text, untyped and uncleaned, with three things added that the file does not carry:
+# MAGIC the match it belongs to, the file it came from and when it was loaded.
+# MAGIC
+# MAGIC Keeping bronze raw means a mistake in the cleaning step later can be fixed by
+# MAGIC re-running from this table, without downloading anything again.
+
+# COMMAND ----------
+
+from pyspark.sql import functions as F
+
+BRONZE = "workspace.rh_lakehouse.bronze_events"
+
+# One row per file, the whole file in a single column. competition_id and season_id
+# come from the folder names.
+files = spark.read.text(f"{RAW}/events", wholetext=True)
+
+bronze = files.select(
+    "competition_id",
+    "season_id",
+    F.regexp_extract(F.col("_metadata.file_name"), r"(\d+)\.json", 1)
+    .cast("long")
+    .alias("match_id"),
+    F.col("_metadata.file_path").alias("source_file"),
+    F.current_timestamp().alias("loaded_at"),
+    # The file is a list of events. Read it as a list of raw strings, then give each
+    # string its own row.
+    F.explode(F.from_json("value", "array<string>")).alias("event_json"),
+)
+
+bronze.write.mode("overwrite").saveAsTable(BRONZE)
+
+# COMMAND ----------
+
+bronze_events = spark.table(BRONZE)
+
+print("files read:", files.count())
+print("bronze rows:", bronze_events.count())
+display(bronze_events.limit(3))
