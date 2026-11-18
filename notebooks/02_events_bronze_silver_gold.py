@@ -308,15 +308,22 @@ display(
 
 # COMMAND ----------
 
+def load_bronze(competition_id: int, season_id: int) -> None:
+    """Put one landed season into bronze, replacing that season if it is already there."""
+    (
+        bronze_rows(competition_id, season_id)
+        .write.mode("overwrite")
+        .option(
+            "replaceWhere",
+            f"competition_id = {competition_id} AND season_id = {season_id}",
+        )
+        .saveAsTable(BRONZE)
+    )
+
+
 # La Liga 2015/16
 land_season(competition_id=11, season_id=27)
-
-(
-    bronze_rows(competition_id=11, season_id=27)
-    .write.mode("overwrite")
-    .option("replaceWhere", "competition_id = 11 AND season_id = 27")
-    .saveAsTable(BRONZE)
-)
+load_bronze(competition_id=11, season_id=27)
 
 display(spark.table(BRONZE).groupBy("competition_id", "season_id").count())
 
@@ -330,28 +337,34 @@ display(spark.table(BRONZE).groupBy("competition_id", "season_id").count())
 # MAGIC   the source record has changed since it was loaded
 # MAGIC - an event that is already there and unchanged is left alone
 # MAGIC
-# MAGIC The Premier League rows are not read, parsed or rewritten. The result of a MERGE is
-# MAGIC a one-row table saying how many rows it inserted and updated.
+# MAGIC The match condition also names the season being loaded. Silver is partitioned by
+# MAGIC competition and season, so that lets Delta go straight to that season's files and
+# MAGIC leave the Premier League ones alone.
+# MAGIC
+# MAGIC The result of a MERGE is a one-row table saying how many rows it inserted and
+# MAGIC updated.
 
 # COMMAND ----------
 
-new_events = silver_rows(
-    spark.table(BRONZE).filter("competition_id = 11 AND season_id = 27")
-)
-new_events.createOrReplaceTempView("new_events")
+def merge_into_silver(competition_id: int, season_id: int):
+    """MERGE one season's bronze rows into silver. Returns the MERGE's row counts."""
+    season = f"competition_id = {competition_id} AND season_id = {season_id}"
+    silver_rows(spark.table(BRONZE).filter(season)).createOrReplaceTempView("new_events")
+    return spark.sql(
+        f"""
+        MERGE INTO {SILVER} AS s
+        USING new_events AS n
+        ON s.competition_id = {competition_id}
+            AND s.season_id = {season_id}
+            AND s.event_id = n.event_id
+        WHEN MATCHED AND s.event_hash <> n.event_hash THEN UPDATE SET *
+        WHEN NOT MATCHED THEN INSERT *
+        """
+    )
 
-merge_sql = f"""
-    MERGE INTO {SILVER} AS s
-    USING new_events AS n
-    ON s.competition_id = n.competition_id
-        AND s.season_id = n.season_id
-        AND s.event_id = n.event_id
-    WHEN MATCHED AND s.event_hash <> n.event_hash THEN UPDATE SET *
-    WHEN NOT MATCHED THEN INSERT *
-"""
 
 print("silver rows before:", spark.table(SILVER).count())
-display(spark.sql(merge_sql))
+display(merge_into_silver(competition_id=11, season_id=27))
 print("silver rows after:", spark.table(SILVER).count())
 
 # COMMAND ----------
@@ -363,7 +376,7 @@ print("silver rows after:", spark.table(SILVER).count())
 
 # COMMAND ----------
 
-display(spark.sql(merge_sql))
+display(merge_into_silver(competition_id=11, season_id=27))
 print("silver rows after a second run:", spark.table(SILVER).count())
 
 # COMMAND ----------
@@ -565,5 +578,5 @@ scan_filters("team = 'Barcelona'")
 # MAGIC %md
 # MAGIC A table this size does not need partitioning. Databricks' own guidance is not to
 # MAGIC partition tables under 1 TB and to use liquid clustering instead. It is partitioned
-# MAGIC here to show how pruning works, and because the MERGE in section 4 joins on the
-# MAGIC partition columns so that it only touches the season being loaded.
+# MAGIC here to show how pruning works, which is also what the MERGE in section 4 relies
+# MAGIC on when it names the season it is loading.
