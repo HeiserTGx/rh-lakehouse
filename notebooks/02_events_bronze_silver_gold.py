@@ -212,3 +212,58 @@ display(
     .select("minute", "team", "player", "x", "y", "shot_xg", "shot_outcome")
     .limit(5)
 )
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 3 · Gold: one row per team per match
+# MAGIC
+# MAGIC Gold is the table someone would actually query. It collapses the events to one row
+# MAGIC per team per match: shots, goals and total xG. That is the same grain notebook 01
+# MAGIC reshaped the match table to, except here it is built up from the events themselves.
+# MAGIC
+# MAGIC A goal is a shot whose outcome is `Goal`, or an own goal credited to the team.
+
+# COMMAND ----------
+
+GOLD = "workspace.rh_lakehouse.gold_team_match_xg"
+
+is_shot = F.col("event_type") == "Shot"
+is_goal = (F.col("shot_outcome") == "Goal") | (F.col("event_type") == "Own Goal For")
+
+gold = (
+    spark.table(SILVER)
+    .groupBy("competition_id", "season_id", "match_id", "team_id", "team")
+    .agg(
+        F.count(F.when(is_shot, True)).alias("shots"),
+        F.count(F.when(is_goal, True)).alias("goals"),
+        F.round(F.coalesce(F.sum("shot_xg"), F.lit(0.0)), 2).alias("xg"),
+    )
+)
+
+gold.write.mode("overwrite").saveAsTable(GOLD)
+
+# COMMAND ----------
+
+gold_xg = spark.table(GOLD)
+
+print("gold rows:", gold_xg.count())
+display(gold_xg.filter(F.col("match_id") == 3754061))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Season totals from the gold table, as a check against the real 2015/16 league table.
+
+# COMMAND ----------
+
+display(
+    gold_xg.groupBy("team")
+    .agg(
+        F.count("*").alias("played"),
+        F.sum("goals").alias("goals"),
+        F.round(F.sum("xg"), 1).alias("xg"),
+    )
+    .orderBy(F.desc("goals"))
+    .limit(6)
+)
