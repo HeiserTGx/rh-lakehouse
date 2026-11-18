@@ -26,6 +26,7 @@
 
 import json
 import os
+import re
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
@@ -512,3 +513,57 @@ display(
     .select("match_date", "home_team", "away_team", "home_goals", "away_goals", "home_xg", "away_xg")
     .limit(5)
 )
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 6 · Partitioning: reading only what a query needs
+# MAGIC
+# MAGIC Silver was written with `partitionBy("competition_id", "season_id")`, so each
+# MAGIC season's rows sit in their own folder, in their own files.
+
+# COMMAND ----------
+
+display(
+    spark.table(SILVER)
+    .groupBy("competition_id", "season_id")
+    .agg(
+        F.count("*").alias("rows"),
+        F.countDistinct(F.col("_metadata.file_path")).alias("files"),
+    )
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC A filter on a partition column is answered from the folder names. Spark drops the
+# MAGIC folders that cannot match before it opens a single file, which is called partition
+# MAGIC pruning. A filter on any other column has no folder to go by: every season is a
+# MAGIC candidate and the filter is applied to the data inside the files.
+# MAGIC
+# MAGIC The plan shows which is which. `PartitionFilters` are applied to folders,
+# MAGIC `DataFilters` to rows.
+
+# COMMAND ----------
+
+
+def scan_filters(where: str) -> None:
+    """Print how Spark applies a filter when it scans silver."""
+    plan = spark.sql(
+        f"EXPLAIN SELECT sum(shot_xg) FROM {SILVER} WHERE {where}"
+    ).first()[0]
+    print(where)
+    for kind, filters in re.findall(r"(PartitionFilters|DataFilters): (\[.*?\])", plan):
+        print(f"    {kind}: {filters}")
+
+
+scan_filters("competition_id = 11")
+scan_filters("team = 'Barcelona'")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC A table this size does not need partitioning. Databricks' own guidance is not to
+# MAGIC partition tables under 1 TB and to use liquid clustering instead. It is partitioned
+# MAGIC here to show how pruning works, and because the MERGE in section 4 joins on the
+# MAGIC partition columns so that it only touches the season being loaded.
