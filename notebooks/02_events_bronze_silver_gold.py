@@ -382,6 +382,34 @@ print("silver rows after a second run:", spark.table(SILVER).count())
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC Two more full leagues from the same season go through the same three steps: land,
+# MAGIC bronze, MERGE. Each one costs one season of work. Nothing already in silver is
+# MAGIC parsed again.
+
+# COMMAND ----------
+
+more_seasons = {
+    "Serie A 2015/16": (12, 27),
+    "Ligue 1 2015/16": (7, 27),
+}
+
+for name, (competition_id, season_id) in more_seasons.items():
+    land_season(competition_id, season_id)
+    load_bronze(competition_id, season_id)
+    counts = merge_into_silver(competition_id, season_id).first()
+    print(f"{name}: {counts['num_inserted_rows']:,} events inserted into silver")
+
+display(
+    spark.table(SILVER)
+    .groupBy("competition_id", "season_id")
+    .count()
+    .orderBy("competition_id")
+)
+print("silver rows:", spark.table(SILVER).count())
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC Gold is small, so it is simply rebuilt from silver.
 
 # COMMAND ----------
@@ -400,8 +428,8 @@ display(
 # MAGIC ## 5 · Joining a big table to a small one: the broadcast join
 # MAGIC
 # MAGIC The events say which team did something, not whether that team was at home. That
-# MAGIC lives in the match list landed next to the events: one row per match, a few hundred
-# MAGIC rows against a few million events.
+# MAGIC lives in the match list landed next to the events: one row per match, under two
+# MAGIC thousand rows against several million events.
 
 # COMMAND ----------
 
