@@ -123,6 +123,6 @@ bronze.write.mode("overwrite").saveAsTable(BRONZE)
 
 bronze_events = spark.table(BRONZE)
 
-print("files read:", files.count())
+print("matches:", bronze_events.select("match_id").distinct().count())
 print("bronze rows:", bronze_events.count())
 display(bronze_events.limit(3))
