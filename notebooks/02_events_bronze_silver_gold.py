@@ -146,6 +146,9 @@ display(bronze_events.limit(3))
 # MAGIC As in notebook 01 the parse uses `FAILFAST`, so an event that does not fit the
 # MAGIC schema stops the run instead of quietly becoming a row of nulls.
 # MAGIC
+# MAGIC Each row also carries a hash of the raw event text. It is used further down to tell
+# MAGIC whether an event that is already in the table has changed at the source.
+# MAGIC
 # MAGIC The table is stored partitioned by competition and season: each season's rows are
 # MAGIC written to their own folder.
 
@@ -193,12 +196,15 @@ def silver_rows(bronze_df):
         # Only shots carry these.
         F.col("event.shot.statsbomb_xg").alias("shot_xg"),
         F.col("event.shot.outcome.name").alias("shot_outcome"),
+        # A fingerprint of the raw event. If the source record changes, so does this.
+        F.sha2("event_json", 256).alias("event_hash"),
     )
 
 
 (
     silver_rows(spark.table(BRONZE))
     .write.mode("overwrite")
+    .option("overwriteSchema", "true")
     .partitionBy("competition_id", "season_id")
     .saveAsTable(SILVER)
 )
@@ -317,8 +323,10 @@ display(spark.table(BRONZE).groupBy("competition_id", "season_id").count())
 # MAGIC %md
 # MAGIC Now silver. `MERGE` compares the incoming events with the table on `event_id`:
 # MAGIC
-# MAGIC - an event that is already there is updated in place
 # MAGIC - an event that is not there is inserted
+# MAGIC - an event that is already there is updated, but only if its hash differs, meaning
+# MAGIC   the source record has changed since it was loaded
+# MAGIC - an event that is already there and unchanged is left alone
 # MAGIC
 # MAGIC The Premier League rows are not read, parsed or rewritten. The result of a MERGE is
 # MAGIC a one-row table saying how many rows it inserted and updated.
@@ -336,7 +344,7 @@ merge_sql = f"""
     ON s.competition_id = n.competition_id
         AND s.season_id = n.season_id
         AND s.event_id = n.event_id
-    WHEN MATCHED THEN UPDATE SET *
+    WHEN MATCHED AND s.event_hash <> n.event_hash THEN UPDATE SET *
     WHEN NOT MATCHED THEN INSERT *
 """
 
@@ -348,8 +356,8 @@ print("silver rows after:", spark.table(SILVER).count())
 
 # MAGIC %md
 # MAGIC The same MERGE again, with the same season. A plain append would add every row a
-# MAGIC second time. MERGE finds each event already in the table, so nothing is inserted
-# MAGIC and the row count does not move.
+# MAGIC second time. MERGE finds each event already in the table, so nothing is inserted.
+# MAGIC No hash differs, so nothing is updated either: the run changes no rows at all.
 
 # COMMAND ----------
 
