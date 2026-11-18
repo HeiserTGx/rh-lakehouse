@@ -566,7 +566,7 @@ def scan_filters(where: str) -> None:
         f"EXPLAIN SELECT sum(shot_xg) FROM {SILVER} WHERE {where}"
     ).first()[0]
     print(where)
-    for kind, filters in re.findall(r"(PartitionFilters|DataFilters): (\[.*?\])", plan):
+    for kind, filters in re.findall(r"\b(PartitionFilters|DataFilters): (\[.*?\])", plan):
         print(f"    {kind}: {filters}")
 
 
