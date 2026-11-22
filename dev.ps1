@@ -1,12 +1,7 @@
-# Start the local Dagster dev server.
-# - loads .env so the Databricks resource can resolve its env vars
+# Start the local Dagster dev server. Run it from the repo root.
+# - dagster dev reads .env from the folder it starts in, so nothing is loaded here
 # - sets a persistent DAGSTER_HOME so materialisation history survives restarts
 $root = $PSScriptRoot
-
-Get-Content (Join-Path $root ".env") | ForEach-Object {
-    $k, $v = $_ -split "=", 2
-    if ($k) { Set-Item "env:$k" $v }
-}
 
 $env:DAGSTER_HOME = Join-Path $root "dagster_home"
 
