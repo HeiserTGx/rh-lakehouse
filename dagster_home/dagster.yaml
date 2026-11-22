@@ -1,0 +1,7 @@
+# Two Dagster runs at a time. A run can have two steps on Databricks at once,
+# and Free Edition allows five concurrent job tasks per account.
+run_coordinator:
+  module: dagster._core.run_coordinator
+  class: QueuedRunCoordinator
+  config:
+    max_concurrent_runs: 2

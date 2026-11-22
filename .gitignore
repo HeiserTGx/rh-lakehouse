@@ -1,2 +1,15 @@
 # Raw data is uploaded to a Databricks volume, not committed.
 data/
+
+# Environment
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Dagster local instance state (keep only the instance config file)
+dagster_home/*
+!dagster_home/dagster.yaml

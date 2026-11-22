@@ -1,0 +1,16 @@
+[project]
+name = "rh_lakehouse"
+version = "0.1.0"
+description = "Dagster orchestration for the rh-lakehouse pipeline: each asset is a serverless run on Databricks"
+requires-python = ">=3.13"
+dependencies = [
+    "dagster",
+    "dagster-webserver",
+    "databricks-sdk",
+]
+
+[tool.setuptools.packages.find]
+include = ["rh_lakehouse*"]
+
+[tool.dagster]
+module_name = "rh_lakehouse.definitions"
